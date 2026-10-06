@@ -1,0 +1,781 @@
+// =====================================================================
+// UJI AKURASI + LUAS DATA BANGUNAN
+// Google Open Buildings v3 vs OSM vs NDBI - Kota Binjai
+// =====================================================================
+
+// ---------- ASSET ----------
+var AOI_ASSET = 'projects/basic-tube-416000/assets/Kota_Binjai';
+var TITIK_BANGUNAN_ASSET    = 'projects/basic-tube-416000/assets/Titik_Uji_Akurasi';
+var TITIK_NONBANGUNAN_ASSET = 'projects/basic-tube-416000/assets/Titik_Uji_Akurasi_NB2';
+var OSM_ASSET               = 'projects/basic-tube-416000/assets/BangunanOSM';
+
+// ---------- PARAMETER ----------
+var S2_START = '2023-05-01';
+var S2_END = '2024-12-31';  // akhir eksklusif
+var CLOUD_MAX = 20;
+var NDBI_THR = 0;
+var SCALE = 10;
+
+var aoi = ee.FeatureCollection(AOI_ASSET).geometry();
+
+// =====================================================================
+// TITIK REFERENSI
+// class: 1 = bangunan
+// class: 0 = bukan bangunan
+// =====================================================================
+
+function setClass(asset, cls, src) {
+  return ee.FeatureCollection(asset).map(function (f) {
+    return ee.Feature(f.geometry()).set({
+      'class': cls,
+      'src': src
+    });
+  });
+}
+
+var ptsB  = setClass(
+  TITIK_BANGUNAN_ASSET,
+  1,
+  'asset_bangunan'
+);
+
+var ptsNB = setClass(
+  TITIK_NONBANGUNAN_ASSET,
+  0,
+  'asset_nonbangunan'
+);
+
+var pts = ptsB.merge(ptsNB);
+
+print('Asset bangunan dipakai:', TITIK_BANGUNAN_ASSET, ptsB.size());
+print('Asset non-bangunan dipakai:', TITIK_NONBANGUNAN_ASSET, ptsNB.size());
+print(
+  'Jumlah titik per kelas (class: jumlah)',
+  pts.aggregate_histogram('class')
+);
+
+// ---------- PETA TITIK REFERENSI ----------
+Map.addLayer(
+  ptsNB,
+  {color: '00ff00'},
+  'Referensi NON-bangunan (asset NB)',
+  false
+);
+
+Map.addLayer(
+  ptsB,
+  {color: 'ffff00'},
+  'Referensi BANGUNAN (asset bangunan)',
+  false
+);
+
+// =====================================================================
+// PREDIKSI 1: GOOGLE OPEN BUILDINGS
+// =====================================================================
+
+var ob = ee.FeatureCollection(
+  'GOOGLE/Research/open-buildings/v3/polygons'
+).filterBounds(aoi);
+
+var predOB = pts.map(function (p) {
+  return p.set(
+    'pred',
+    ob.filterBounds(p.geometry()).size().gt(0)
+  );
+});
+
+// =====================================================================
+// PREDIKSI 2: OSM
+// =====================================================================
+
+var osm = ee.FeatureCollection(OSM_ASSET)
+  .filterBounds(aoi);
+
+var predOSM = pts.map(function (p) {
+  return p.set(
+    'pred',
+    osm.filterBounds(p.geometry()).size().gt(0)
+  );
+});
+
+// =====================================================================
+// LUAS DATASET
+// =====================================================================
+
+// ---------- LUAS AOI ----------
+var luasAOI_m2 = aoi.area(1);
+var luasAOI_ha = luasAOI_m2.divide(10000);
+var luasAOI_km2 = luasAOI_m2.divide(1000000);
+
+// ---------- LUAS GOOGLE OPEN BUILDINGS ----------
+var luasOB_m2 = ob.geometry().area(1);
+var luasOB_ha = luasOB_m2.divide(10000);
+var luasOB_km2 = luasOB_m2.divide(1000000);
+
+// ---------- LUAS OSM ----------
+var luasOSM_m2 = osm.geometry().area(1);
+var luasOSM_ha = luasOSM_m2.divide(10000);
+var luasOSM_km2 = luasOSM_m2.divide(1000000);
+
+print('=================================================');
+print('LUAS DATASET');
+print('=================================================');
+
+print('Luas AOI Kota Binjai (m²):', luasAOI_m2);
+print('Luas AOI Kota Binjai (ha):', luasAOI_ha);
+print('Luas AOI Kota Binjai (km²):', luasAOI_km2);
+
+print('Google Open Buildings (m²):', luasOB_m2);
+print('Google Open Buildings (ha):', luasOB_ha);
+print('Google Open Buildings (km²):', luasOB_km2);
+
+print('OSM Buildings (m²):', luasOSM_m2);
+print('OSM Buildings (ha):', luasOSM_ha);
+print('OSM Buildings (km²):', luasOSM_km2);
+
+// =====================================================================
+// PREDIKSI 3: NDBI
+// =====================================================================
+
+var s2 = ee.ImageCollection(
+  'COPERNICUS/S2_SR_HARMONIZED'
+)
+.filterBounds(aoi)
+.filterDate(S2_START, S2_END)
+.filter(
+  ee.Filter.lt(
+    'CLOUDY_PIXEL_PERCENTAGE',
+    CLOUD_MAX
+  )
+)
+.map(function (img) {
+
+  var scl = img.select('SCL');
+
+  return img.updateMask(
+    scl.neq(3)
+      .and(scl.neq(8))
+      .and(scl.neq(9))
+      .and(scl.neq(10))
+      .and(scl.neq(11))
+  );
+
+});
+
+print('Jumlah scene Sentinel-2:', s2.size());
+
+var composite = s2
+  .median()
+  .clip(aoi);
+
+var ndbiImg = composite
+  .normalizedDifference(['B11', 'B8'])
+  .rename('ndbi');
+
+var built = ndbiImg
+  .gt(NDBI_THR)
+  .rename('built')
+  .unmask(0);
+
+// =====================================================================
+// LUAS NDBI
+// =====================================================================
+
+var luasNDBI_m2 = built
+  .selfMask()
+  .multiply(ee.Image.pixelArea())
+  .reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: aoi,
+    scale: SCALE,
+    maxPixels: 1e13
+  })
+  .get('built');
+
+luasNDBI_m2 = ee.Number(luasNDBI_m2);
+
+var luasNDBI_ha = luasNDBI_m2
+  .divide(10000);
+
+var luasNDBI_km2 = luasNDBI_m2
+  .divide(1000000);
+
+print('NDBI Built-up (m²):', luasNDBI_m2);
+print('NDBI Built-up (ha):', luasNDBI_ha);
+print('NDBI Built-up (km²):', luasNDBI_km2);
+
+// ---------- PREDIKSI NDBI PADA TITIK ----------
+var predNDBI = built
+  .addBands(ndbiImg)
+  .reduceRegions({
+    collection: pts,
+    reducer: ee.Reducer.first(),
+    scale: SCALE
+  })
+  .map(function (f) {
+    return f.set(
+      'pred',
+      f.get('built')
+    );
+  });
+
+// =====================================================================
+// PERSENTASE LUAS TERHADAP AOI
+// =====================================================================
+
+var persenOB = luasOB_m2
+  .divide(luasAOI_m2)
+  .multiply(100);
+
+var persenOSM = luasOSM_m2
+  .divide(luasAOI_m2)
+  .multiply(100);
+
+var persenNDBI = luasNDBI_m2
+  .divide(luasAOI_m2)
+  .multiply(100);
+
+print('Persentase Google Open Buildings terhadap AOI (%):', persenOB);
+print('Persentase OSM terhadap AOI (%):', persenOSM);
+print('Persentase NDBI terhadap AOI (%):', persenNDBI);
+
+// =====================================================================
+// TABEL RINGKASAN LUAS
+// =====================================================================
+
+var luasTable = ee.FeatureCollection([
+
+  ee.Feature(null, {
+    Dataset: 'Google Open Buildings',
+    Luas_m2: luasOB_m2,
+    Luas_ha: luasOB_ha,
+    Luas_km2: luasOB_km2,
+    Persen_AOI: persenOB
+  }),
+
+  ee.Feature(null, {
+    Dataset: 'OSM Buildings',
+    Luas_m2: luasOSM_m2,
+    Luas_ha: luasOSM_ha,
+    Luas_km2: luasOSM_km2,
+    Persen_AOI: persenOSM
+  }),
+
+  ee.Feature(null, {
+    Dataset: 'NDBI',
+    Luas_m2: luasNDBI_m2,
+    Luas_ha: luasNDBI_ha,
+    Luas_km2: luasNDBI_km2,
+    Persen_AOI: persenNDBI
+  })
+
+]);
+
+print('=================================================');
+print('TABEL RINGKASAN LUAS BANGUNAN');
+print('=================================================');
+print(luasTable);
+
+// =====================================================================
+// CONFUSION MATRIX + METRIK
+// =====================================================================
+
+function count(fc, cls, pred) {
+
+  return ee.Number(
+    fc.filter(
+      ee.Filter.and(
+        ee.Filter.eq('class', cls),
+        ee.Filter.eq('pred', pred)
+      )
+    ).size()
+  );
+
+}
+
+function evaluate(name, fc) {
+
+  var tp = count(fc, 1, 1);
+  var fn = count(fc, 1, 0);
+  var fp = count(fc, 0, 1);
+  var tn = count(fc, 0, 0);
+
+  var n = tp
+    .add(fn)
+    .add(fp)
+    .add(tn);
+
+  var prec = tp.divide(
+    tp.add(fp)
+  );
+
+  var rec = tp.divide(
+    tp.add(fn)
+  );
+
+  return ee.Dictionary({
+
+    method: name,
+
+    TP: tp,
+    FN: fn,
+    FP: fp,
+    TN: tn,
+    N: n,
+
+    OA_pct:
+      tp.add(tn)
+        .divide(n)
+        .multiply(100),
+
+    Precision_UA_pct:
+      prec.multiply(100),
+
+    Recall_PA_pct:
+      rec.multiply(100),
+
+    F1_pct:
+      prec
+        .multiply(rec)
+        .multiply(2)
+        .divide(prec.add(rec))
+        .multiply(100),
+
+    IoU_pct:
+      tp
+        .divide(
+          tp.add(fp).add(fn)
+        )
+        .multiply(100)
+
+  });
+
+}
+
+var results = ee.List([
+
+  evaluate(
+    'Google Open Buildings',
+    predOB
+  ),
+
+  evaluate(
+    'OSM Buildings',
+    predOSM
+  ),
+
+  evaluate(
+    'NDBI',
+    predNDBI
+  )
+
+]);
+
+print('=================================================');
+print('HASIL UJI AKURASI');
+print('=================================================');
+print(results);
+
+// =====================================================================
+// COUNTS.CSV
+// =====================================================================
+
+results.evaluate(function (list) {
+
+  if (!list) {
+
+    print(
+      'Gagal menghitung - cek asset / error di atas'
+    );
+
+    return;
+  }
+
+  var csv = [
+    'method,TP,FN,FP,TN'
+  ];
+
+  list.forEach(function (d) {
+
+    csv.push(
+      [
+        d.method,
+        d.TP,
+        d.FN,
+        d.FP,
+        d.TN
+      ].join(',')
+    );
+
+  });
+
+  print(
+    'Salin ke counts.csv:\n' +
+    csv.join('\n')
+  );
+
+});
+
+// =====================================================================
+// EKSPOR TITIK YANG SALAH KLASIFIKASI
+// =====================================================================
+
+// FP = titik non-bangunan terdeteksi sebagai bangunan
+// FN = titik bangunan tidak terdeteksi
+
+function errorPoints(name, fc) {
+
+  function tag(f, err) {
+
+    var c = f.geometry().coordinates();
+
+    return f.set({
+
+      dataset: name,
+
+      error: err,
+
+      lon: c.get(0),
+
+      lat: c.get(1)
+
+    });
+
+  }
+
+  var fp = fc
+    .filter(
+      ee.Filter.and(
+        ee.Filter.eq('class', 0),
+        ee.Filter.eq('pred', 1)
+      )
+    )
+    .map(function (f) {
+
+      return tag(
+        f,
+        'FP'
+      );
+
+    });
+
+  var fn = fc
+    .filter(
+      ee.Filter.and(
+        ee.Filter.eq('class', 1),
+        ee.Filter.eq('pred', 0)
+      )
+    )
+    .map(function (f) {
+
+      return tag(
+        f,
+        'FN'
+      );
+
+    });
+
+  return fp.merge(fn);
+
+}
+
+var errNDBI =
+  errorPoints(
+    'NDBI',
+    predNDBI
+  );
+
+var errOB =
+  errorPoints(
+    'Google Open Buildings',
+    predOB
+  );
+
+var errOSM =
+  errorPoints(
+    'OSM',
+    predOSM
+  );
+
+var errAll =
+  errNDBI
+    .merge(errOB)
+    .merge(errOSM);
+
+print(
+  'Jumlah titik salah (semua dataset):',
+  errAll.size()
+);
+
+// =====================================================================
+// DIAGNOSTIK
+// =====================================================================
+
+var fpNDBI =
+  errNDBI.filter(
+    ee.Filter.eq(
+      'error',
+      'FP'
+    )
+  );
+
+print(
+  'NDBI FP total:',
+  fpNDBI.size()
+);
+
+print(
+  'NDBI FP per asal titik (src):',
+  fpNDBI.aggregate_histogram(
+    'src'
+  )
+);
+
+print(
+  'OSM FP per asal titik (src):',
+  errOSM
+    .filter(
+      ee.Filter.eq(
+        'error',
+        'FP'
+      )
+    )
+    .aggregate_histogram(
+      'src'
+    )
+);
+
+print(
+  'GOB FP per asal titik (src):',
+  errOB
+    .filter(
+      ee.Filter.eq(
+        'error',
+        'FP'
+      )
+    )
+    .aggregate_histogram(
+      'src'
+    )
+);
+
+print(
+  'Titik FN NDBI per asal (harus asset_bangunan):',
+  errNDBI
+    .filter(
+      ee.Filter.eq(
+        'error',
+        'FN'
+      )
+    )
+    .aggregate_histogram(
+      'src'
+    )
+);
+
+// =====================================================================
+// PETA
+// =====================================================================
+
+Map.centerObject(
+  aoi,
+  12
+);
+
+Map.addLayer(
+  errNDBI.filter(
+    ee.Filter.eq(
+      'error',
+      'FP'
+    )
+  ),
+  {color: 'red'},
+  'NDBI false positive (67)'
+);
+
+Map.addLayer(
+  errNDBI.filter(
+    ee.Filter.eq(
+      'error',
+      'FN'
+    )
+  ),
+  {color: 'orange'},
+  'NDBI false negative (30)',
+  false
+);
+
+Map.addLayer(
+  errOB,
+  {color: 'yellow'},
+  'Open Buildings salah',
+  false
+);
+
+Map.addLayer(
+  errOSM,
+  {color: 'cyan'},
+  'OSM salah',
+  false
+);
+
+// =====================================================================
+// EKSPOR SEMUA TITIK SALAH
+// =====================================================================
+
+Export.table.toDrive({
+
+  collection: errAll,
+
+  description:
+    'v2_Titik_Salah_Klasifikasi_KML',
+
+  folder:
+    'GEE_Output',
+
+  fileFormat:
+    'KML'
+
+});
+
+Export.table.toDrive({
+
+  collection: errAll,
+
+  description:
+    'v2_Titik_Salah_Klasifikasi_CSV',
+
+  folder:
+    'GEE_Output',
+
+  fileFormat:
+    'CSV',
+
+  selectors: [
+    'dataset',
+    'error',
+    'class',
+    'src',
+    'pred',
+    'ndbi',
+    'lon',
+    'lat'
+  ]
+
+});
+
+// =====================================================================
+// EKSPOR TERPISAH
+// =====================================================================
+
+function exportKml(
+  fc,
+  err,
+  name
+) {
+
+  Export.table.toDrive({
+
+    collection:
+      fc.filter(
+        ee.Filter.eq(
+          'error',
+          err
+        )
+      ),
+
+    description:
+      name,
+
+    folder:
+      'GEE_Output',
+
+    fileFormat:
+      'KML'
+
+  });
+
+}
+
+// ---------- NDBI ----------
+exportKml(
+  errNDBI,
+  'FP',
+  'v2_NDBI_FP_titikNonBangunanTerdeteksiBangunan'
+);
+
+exportKml(
+  errNDBI,
+  'FN',
+  'v2_NDBI_FN_titikBangunanTidakTerdeteksi'
+);
+
+// ---------- OSM ----------
+exportKml(
+  errOSM,
+  'FP',
+  'v2_OSM_FP'
+);
+
+exportKml(
+  errOSM,
+  'FN',
+  'v2_OSM_FN_titikBangunanTidakTerdeteksi'
+);
+
+// ---------- GOOGLE OPEN BUILDINGS ----------
+exportKml(
+  errOB,
+  'FP',
+  'v2_GOB_FP'
+);
+
+exportKml(
+  errOB,
+  'FN',
+  'v2_GOB_FN_titikBangunanTidakTerdeteksi'
+);
+
+// ===== SECTION 2: JUMLAH, DUPLIKAT, KEPADATAN, SENSITIVITAS THRESHOLD =====
+var obAll = ee.FeatureCollection('GOOGLE/Research/open-buildings/v3/polygons')
+  .filterBounds(aoi);
+
+print('GOB jumlah poligon:', obAll.size());
+print('GOB jumlah full_plus_code unik:', obAll.aggregate_count_distinct('full_plus_code'));
+print('GOB poligon luas nol:', obAll.filter(ee.Filter.lte('area_in_meters', 0)).size());
+print('GOB confidence min/max:', obAll.aggregate_min('confidence'), obAll.aggregate_max('confidence'));
+print('GOB rata-rata luas (m2):', obAll.aggregate_mean('area_in_meters'));
+print('GOB jumlah luas poligon (ha):',
+  ee.Number(obAll.aggregate_sum('area_in_meters')).divide(10000));
+print('GOB kepadatan (unit/km2):', obAll.size().divide(luasAOI_km2));
+
+print('OSM jumlah poligon:', osm.size());
+print('OSM kepadatan (unit/km2):', osm.size().divide(luasAOI_km2));
+
+var thresholds = [0.65, 0.70, 0.75, 0.80, 0.85, 0.90];
+var sens = ee.FeatureCollection(thresholds.map(function (t) {
+  var f = obAll.filter(ee.Filter.gte('confidence', t));
+  var predT = pts.map(function (p) {
+    return p.set('pred', f.filterBounds(p.geometry()).size().gt(0));
+  });
+  var ev = evaluate('GOB>=' + t, predT);
+  return ee.Feature(null, {
+    threshold: t,
+    n_buildings: f.size(),
+    area_ha: f.geometry().area(1).divide(10000),
+    TP: ev.get('TP'), FN: ev.get('FN'),
+    FP: ev.get('FP'), TN: ev.get('TN')
+  });
+}));
+print('Sensitivitas threshold:', sens);
+
+Export.table.toDrive({
+  collection: sens,
+  description: 'Tabel_S1_Sensitivitas_Threshold',
+  folder: 'GEE_Output',
+  fileFormat: 'CSV'
+});
+
+// =====================================================================
+// SELESAI
+// =====================================================================
