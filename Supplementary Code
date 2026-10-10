@@ -776,6 +776,42 @@ Export.table.toDrive({
   fileFormat: 'CSV'
 });
 
+var diag = composite.select(['B3', 'B8', 'B11'])
+  .addBands(ndbiImg)
+  .addBands(composite.normalizedDifference(['B3', 'B11']).rename('mndwi'))
+  .addBands(composite.normalizedDifference(['B8', 'B4']).rename('ndvi'))
+  .reduceRegions({
+    collection: fpNDBI,
+    reducer: ee.Reducer.first(),
+    scale: 10
+  });
+
+Export.table.toDrive({
+  collection: diag,
+  description: 'NDBI_FP_diagnostik',
+  folder: 'GEE_Output',
+  fileFormat: 'CSV'
+});
+
+var proj = ee.Projection('EPSG:32647');
+var grid = aoi.coveringGrid(proj, 1000);
+var cent = obAll.map(function (f) {
+  return ee.Feature(f.geometry().centroid(1));
+});
+var gridN = grid.map(function (c) {
+  var inside = c.geometry().intersection(aoi, 1);
+  return c.set({
+    n_buildings: cent.filterBounds(c.geometry()).size(),
+    area_km2: inside.area(1).divide(1e6)
+  });
+});
+Export.table.toDrive({
+  collection: gridN,
+  description: 'Grid1km_jumlah_bangunan_GOB',
+  folder: 'GEE_Output',
+  fileFormat: 'CSV',
+  selectors: ['n_buildings', 'area_km2']
+});
 // =====================================================================
 // SELESAI
 // =====================================================================
